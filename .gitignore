@@ -1,0 +1,42 @@
+# Runtime data (jobs, SQLite, PDB cache, uploads, API keys in DB)
+data/
+
+# Secrets
+.env
+.env.*
+*.pem
+credentials.json
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+ui/dist/
+
+# Local binaries / symbols
+*.sys
+*.pdb
+*.obj
+*.ilk
+*.exp
+*.lib
+
+# Logs / IDE
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local scratch
+_impact_status.json
+_impact_*.py
+_sum_*.py

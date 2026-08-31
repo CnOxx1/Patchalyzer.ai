@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Patchalyzer.ai</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/style.css?v=20260826e" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.11/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <span class="logo" aria-hidden="true"></span>
+        <div>
+          <h1>Patchalyzer.ai</h1>
+          <p>补丁对照分析</p>
+        </div>
+      </div>
+      <nav class="sidebar-nav" role="tablist">
+        <button class="nav-btn active" data-tab="home" type="button">主页</button>
+        <button class="nav-btn" data-tab="analyze" type="button">上传分析</button>
+        <button class="nav-btn" data-tab="patch" type="button">补丁列表</button>
+        <button class="nav-btn" data-tab="jobs" type="button">任务情况<span id="nav-live" class="nav-dot hidden"></span></button>
+      </nav>
+    </aside>
+    <div class="app-content">
+    <main class="vt-main wide">
+      <section id="tab-home" class="tab active">
+        <div class="panel-head">
+          <div>
+            <p id="home-lead">任务与运行概况</p>
+            <p class="hint">服务状态、分析队列和最近任务。点一条即可打开报告。</p>
+          </div>
+          <button type="button" class="btn ghost" id="refresh-home">刷新</button>
+        </div>
+        <div id="home-stats" class="home-stats"></div>
+        <div class="home-grid">
+          <div class="home-card">
+            <p class="card-title">当前运行</p>
+            <div id="home-live"></div>
+          </div>
+          <div class="home-card">
+            <p class="card-title">项目状态</p>
+            <div id="home-service"></div>
+          </div>
+        </div>
+        <div class="home-card home-recent">
+          <div class="panel-head">
+            <p>最近任务</p>
+            <button type="button" class="btn ghost nav-jump" data-tab="jobs">全部任务</button>
+          </div>
+          <div id="home-jobs" class="jobs-list"></div>
+        </div>
+      </section>
+
+      <section id="tab-analyze" class="tab">
+        <form id="analyze-form" class="upload-stage">
+          <div class="scan-art" aria-hidden="true">
+            <svg viewBox="0 0 120 140" width="88" height="104">
+              <rect x="28" y="12" width="64" height="88" rx="4" fill="none" stroke="currentColor" stroke-width="3"/>
+              <path d="M76 12 v16 h16" fill="none" stroke="currentColor" stroke-width="3"/>
+              <circle cx="60" cy="58" r="16" fill="none" stroke="currentColor" stroke-width="2.5"/>
+              <circle cx="60" cy="58" r="8" fill="none" stroke="currentColor" stroke-width="2"/>
+              <path d="M60 42 v32 M48 58 h24" stroke="currentColor" stroke-width="1.5" opacity=".5"/>
+              <rect class="scan-line" x="22" y="54" width="76" height="3" rx="1"/>
+            </svg>
+          </div>
+
+          <label class="choose-btn drop-card">
+            <span class="choose-label">漏洞样本（可选）</span>
+            <span class="choose-cta">Choose file</span>
+            <span class="drop-name" data-empty=""></span>
+            <input type="file" name="old_file" accept=".sys,.dll,.exe" />
+          </label>
+
+          <div class="meta-fields">
+            <input name="cve" required placeholder="CVE-2026-68820" />
+            <input name="filename" placeholder="组件文件名（可空，如 afd.sys）" />
+            <input name="title" placeholder="任务名称（可留空，默认用 CVE）" />
+            <label class="switch">
+              <input type="checkbox" name="run_llm" id="run-llm" checked />
+              <span>启用 LLM Agent</span>
+            </label>
+            <div id="agent-picker" class="agent-picker">
+              <div class="agent-picker-head">
+                <span>启动哪些 Agent</span>
+                <div class="agent-presets">
+                  <button type="button" data-agents="all">全选</button>
+                  <button type="button" data-agents="core">核心解读</button>
+                  <button type="button" data-agents="soc">检测与报告</button>
+                  <button type="button" data-agents="report">只要报告</button>
+                  <button type="button" data-agents="none">全不选</button>
+                </div>
+              </div>
+              <div id="agent-checks" class="agent-checks"></div>
+              <div class="routing-mode" role="radiogroup" aria-label="专家编制">
+                <label><input type="radio" name="routing_mode" value="auto" checked /> 自动编制</label>
+                <label><input type="radio" name="routing_mode" value="manual" /> 手动编制</label>
+              </div>
+              <p class="hint">自动编制会在工具跑完后按证据裁剪专家；勾选是上限，未勾选的仍会跳过。手动编制则按勾选全部运行。PE / PDB / 反汇编等工具节点始终运行。选择会记在本机。</p>
+            </div>
+          </div>
+
+          <details class="advanced">
+            <summary>高级：手动指定修复版</summary>
+            <p class="hint">若自动下载失败，可在此上传修复版 / 更早版本。</p>
+            <div class="choose-row">
+              <label class="choose-btn drop-card">
+                <span class="choose-label">修复版</span>
+                <span class="choose-cta">Choose file</span>
+                <span class="drop-name" data-empty=""></span>
+                <input type="file" name="new_file" accept=".sys,.dll,.exe" />
+              </label>
+              <label class="choose-btn drop-card">
+                <span class="choose-label">更早版本</span>
+                <span class="choose-cta">可选</span>
+                <span class="drop-name" data-empty=""></span>
+                <input type="file" name="mid_file" accept=".sys,.dll,.exe" />
+              </label>
+            </div>
+            <div class="meta-inline">
+              <input name="old_label" placeholder="漏洞版标签" />
+              <input name="new_label" placeholder="修复版标签" />
+              <input name="mid_label" placeholder="更早版本标签" />
+            </div>
+          </details>
+
+          <button type="submit" class="btn primary analyze-go">开始分析</button>
+          <p class="legal">
+            不必上传样本：填 CVE 后从 MSRC KB + Winbindex 下载同分支「漏洞版 → 修复版」。知道文件名更准；否则按公告标题推断（afd.sys / tcpip.sys 等）。本地样本仍可用于对照。
+          </p>
+        </form>
+
+        <div id="analyze-status" class="status-card hidden">
+          <div class="status-head">
+            <span class="pulse"></span>
+            <span>分析进行中</span>
+          </div>
+          <div class="progress-bar"><div id="progress-fill"></div></div>
+          <p id="progress-text"></p>
+          <button type="button" id="cancel-job" class="btn ghost hidden">取消任务</button>
+        </div>
+      </section>
+
+      <section id="tab-patch" class="tab">
+        <div class="panel-head">
+          <div>
+            <p id="patch-meta">选择一个补丁日查看 CVE 列表</p>
+            <p class="hint">补丁日与 CVE 列表拉取一次后保存在本地。点进某条可看 MSRC 描述，再决定要不要分析。点「刷新」才重新向微软拉取。</p>
+          </div>
+          <div class="patch-actions">
+            <button id="patch-back" class="btn ghost hidden" type="button">返回补丁日</button>
+            <button id="refresh-patch" class="btn ghost" type="button">刷新</button>
+            <button id="auto-patch-now" class="btn ghost hidden" type="button">分析本期内核 CVE</button>
+          </div>
+        </div>
+        <div class="patch-watch">
+          <label class="switch"><input type="checkbox" id="watch-enabled" checked /> 监控补丁日</label>
+          <label class="switch"><input type="checkbox" id="watch-auto" /> 新补丁日自动分析内核/驱动</label>
+        </div>
+        <div id="patch-filters" class="patch-filters hidden">
+          <button type="button" class="patch-filter active" data-impact="weaponizable">可利用向</button>
+          <button type="button" class="patch-filter" data-impact="all">全部</button>
+          <button type="button" class="patch-filter" data-impact="dos">拒绝服务</button>
+          <button type="button" class="patch-filter" data-impact="info">信息泄露</button>
+          <label class="switch"><input type="checkbox" id="patch-kernel-only" /> 仅内核/驱动</label>
+        </div>
+        <div class="patch-board">
+          <div id="patch-list" class="patch-list"></div>
+          <aside id="patch-detail" class="patch-detail hidden">
+            <p class="hint">点一条 CVE，右侧显示 MSRC 公告描述，便于判断要不要分析。</p>
+          </aside>
+        </div>
+      </section>
+
+      <section id="tab-jobs" class="tab">
+        <div class="panel-head">
+          <p>点击任务打开全屏报告。流水线以逻辑节点图呈现，点节点查看详情。</p>
+          <button id="refresh-jobs" class="btn ghost" type="button">刷新</button>
+        </div>
+        <div id="jobs-list" class="jobs-list"></div>
+      </section>
+    </main>
+
+    <footer class="vt-foot">
+      需要自动生成报告？点击右上角 <button type="button" class="text-link" id="goto-settings">SETTINGS</button> 填写 API Key 与提示词。
+    </footer>
+    </div>
+  </div>
+
+  <button type="button" id="open-settings" class="settings-fab" aria-label="打开设置">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+      <path fill="currentColor" d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.2 7.2 0 0 0-1.63-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.59.22-1.14.52-1.64.94l-2.39-.96a.5.5 0 0 0-.6.22L2.8 8.84a.5.5 0 0 0 .12.64L4.95 11.06c-.04.31-.06.63-.06.94s.02.63.06.94L2.92 14.52a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.43.34.7.22l2.39-.96c.5.42 1.05.77 1.64.94l.36 2.54c.05.24.25.42.49.42h3.8c.24 0 .44-.18.49-.42l.36-2.54c.59-.17 1.14-.52 1.63-.94l2.39.96c.27.12.56.02.7-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/>
+    </svg>
+    SETTINGS
+  </button>
+
+  <div id="settings-drawer" class="settings-drawer hidden">
+    <div class="settings-panel">
+      <header class="settings-head">
+        <div>
+          <p class="eyebrow">Patchalyzer.ai</p>
+          <h2>设置</h2>
+        </div>
+        <button type="button" id="close-settings" class="icon-btn" aria-label="关闭设置">×</button>
+      </header>
+      <div class="settings-tabs" role="tablist">
+        <button type="button" class="stab active" data-s="llm">模型</button>
+        <button type="button" class="stab" data-s="prompts">提示词</button>
+      </div>
+      <form id="settings-form" class="settings-body">
+        <div id="s-llm" class="s-pane active">
+          <p class="panel-lead">配置 OpenAI 兼容 API，用于生成分析报告。</p>
+          <div class="form-grid">
+            <label>Provider<input name="provider" placeholder="openai" /></label>
+            <label>Model<input name="model" placeholder="gpt-4o-mini" /></label>
+            <label class="full">Base URL<input name="base_url" placeholder="https://api.openai.com/v1" /></label>
+            <label class="full">API Key<input name="api_key" type="password" placeholder="sk-…" autocomplete="off" /></label>
+            <label>Temperature<input name="temperature" type="number" step="0.1" min="0" max="2" /></label>
+            <label>Max Tokens<input name="max_tokens" type="number" min="256" max="128000" /></label>
+          </div>
+          <p id="key-preview" class="hint"></p>
+          <div class="presets">
+            <span>预设</span>
+            <button type="button" class="preset" data-url="https://api.openai.com/v1" data-model="gpt-4o-mini">OpenAI</button>
+            <button type="button" class="preset" data-url="https://api.deepseek.com/v1" data-model="deepseek-chat">DeepSeek</button>
+            <button type="button" class="preset" data-url="http://127.0.0.1:11434/v1" data-model="llama3.2">Ollama</button>
+          </div>
+        </div>
+        <div id="s-prompts" class="s-pane">
+          <p class="panel-lead">全局约束作用于所有 Agent；各专家提示词只作用于对应节点。</p>
+          <div class="form-grid">
+            <label>报告语言
+              <select name="language">
+                <option value="zh">中文</option>
+                <option value="en">English</option>
+              </select>
+            </label>
+            <label class="full">额外关注（可选）
+              <input name="extra_focus" placeholder="例如：重点分析 Feature 开关与竞态，忽略纯重定位噪声" />
+            </label>
+            <label class="full">全局约束
+              <textarea name="system_prompt" rows="5"></textarea>
+            </label>
+            <label class="full">报告结构
+              <textarea name="report_structure" rows="8"></textarea>
+            </label>
+            <label class="full">Agent 系统提示词
+              <div class="prompt-toolbar">
+                <select id="prompt-agent"></select>
+                <button type="button" id="reset-agent-prompt" class="btn ghost">恢复该条默认</button>
+                <button type="button" id="gepa-optimize" class="btn ghost">GEPA 优化当前</button>
+              </div>
+              <textarea id="agent-prompt-text" rows="8"></textarea>
+            </label>
+          </div>
+          <p class="hint">修改后需重新生成报告才会生效。GEPA 用历史任务离线进化提示词，一次只优化当前选中的分析师，大约需要几分钟，不会插入分析流水线。</p>
+        </div>
+        <div class="settings-foot">
+          <p id="settings-msg" class="msg"></p>
+          <div class="btn-row">
+            <button type="submit" class="btn primary">保存</button>
+            <button type="button" id="test-llm" class="btn ghost">测试连接</button>
+            <button type="button" id="reset-prompts" class="btn ghost">提示词恢复默认</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="job-modal" class="drawer hidden">
+    <div class="drawer-inner vt-report">
+      <button id="modal-close" class="icon-btn report-close" aria-label="关闭">×</button>
+
+      <header class="report-hero">
+        <div class="detect-ring" id="detect-ring" aria-hidden="true">
+          <svg viewBox="0 0 96 96" width="88" height="88">
+            <circle class="ring-bg" cx="48" cy="48" r="40"/>
+            <circle class="ring-fg" id="ring-fg" cx="48" cy="48" r="40"/>
+          </svg>
+          <div class="ring-label">
+            <strong id="ring-value">—</strong>
+            <span id="ring-sub">状态</span>
+          </div>
+        </div>
+        <div class="report-meta">
+          <p class="eyebrow">任务报告</p>
+          <h2 id="modal-title"></h2>
+          <p class="report-sub" id="modal-sub"></p>
+          <div class="hash-row">
+            <span class="hash-label">JOB</span>
+            <code id="modal-job-id"></code>
+            <button type="button" class="copy-btn" id="copy-job-id" title="复制">复制</button>
+          </div>
+          <div class="tag-row" id="modal-tags"></div>
+        </div>
+        <div class="report-actions">
+          <button id="regen-report" class="btn primary">重新生成报告</button>
+          <div class="export-wrap">
+            <button type="button" id="export-report" class="btn ghost">导出 ▾</button>
+            <div id="export-menu" class="export-menu hidden">
+              <div class="export-picker-head">
+                <span>导出哪些章节</span>
+                <div class="export-presets">
+                  <button type="button" data-export-preset="all">全选</button>
+                  <button type="button" data-export-preset="core">核心解读</button>
+                  <button type="button" data-export-preset="soc">检测运营</button>
+                  <button type="button" data-export-preset="none">全不选</button>
+                </div>
+              </div>
+              <div id="export-sections" class="export-sections"></div>
+              <p class="export-picker-hint">默认导出运营关心的章节（§1 / §12 / §16–19）。未勾选的不会写入 PDF / HTML / Markdown。</p>
+              <div class="export-formats">
+                <button type="button" data-export="pdf">PDF（含公式）</button>
+                <button type="button" data-export="html">HTML（含公式）</button>
+                <button type="button" data-export="md">Markdown</button>
+              </div>
+              <div class="export-extras">
+                <a id="download-ioc" target="_blank">IOC JSON</a>
+                <a id="download-threat" target="_blank">威胁情报 JSON</a>
+                <a id="download-bypass" target="_blank">绕过面 JSON</a>
+                <a id="download-residual" target="_blank">残留漏洞 JSON</a>
+              </div>
+            </div>
+          </div>
+          <a id="download-cfg" class="btn ghost" target="_blank">CFG</a>
+          <a id="download-verify" class="btn ghost" target="_blank">验证 ZIP</a>
+        </div>
+      </header>
+
+      <div class="modal-tabs-wrap">
+        <div class="tab-tier tab-tier-main">
+          <span class="tab-tier-label">结论</span>
+          <div class="modal-tabs vt-tabs">
+            <button class="modal-tab" data-panel="summary">摘要</button>
+            <button class="modal-tab" data-panel="chain">漏洞链</button>
+            <button class="modal-tab" data-panel="ioc">IOC / 检测</button>
+            <button class="modal-tab" data-panel="threat">在野利用</button>
+            <button class="modal-tab" data-panel="bypass">绕过面</button>
+            <button class="modal-tab" data-panel="residual">残留漏洞</button>
+            <button class="modal-tab" data-panel="huntlab">深度狩猎</button>
+            <button class="modal-tab active" data-panel="community">流水线</button>
+          </div>
+        </div>
+        <div class="tab-tier tab-tier-evidence">
+          <span class="tab-tier-label">证据</span>
+          <div class="modal-tabs vt-tabs">
+            <button class="modal-tab" data-panel="control">对照</button>
+            <button class="modal-tab" data-panel="timeline">时间线</button>
+            <button class="modal-tab" data-panel="bytediff">字节</button>
+            <button class="modal-tab" data-panel="symbols">符号</button>
+            <button class="modal-tab" data-panel="disasm">反汇编</button>
+            <button class="modal-tab" data-panel="cfg">CFG</button>
+            <button class="modal-tab" data-panel="feature">Feature</button>
+            <button class="modal-tab" data-panel="verify">验证包</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="drawer-body">
+        <div id="panel-community" class="modal-panel graph-panel active"></div>
+        <div id="panel-summary" class="modal-panel"></div>
+        <div id="panel-chain" class="modal-panel"></div>
+        <div id="panel-ioc" class="modal-panel"></div>
+        <div id="panel-threat" class="modal-panel"></div>
+        <div id="panel-bypass" class="modal-panel"></div>
+        <div id="panel-residual" class="modal-panel"></div>
+        <div id="panel-huntlab" class="modal-panel"></div>
+        <div id="panel-control" class="modal-panel"></div>
+        <div id="panel-timeline" class="modal-panel"></div>
+        <div id="panel-bytediff" class="modal-panel"></div>
+        <div id="panel-symbols" class="modal-panel"></div>
+        <div id="panel-disasm" class="modal-panel"></div>
+        <div id="panel-cfg" class="modal-panel"></div>
+        <div id="panel-feature" class="modal-panel"></div>
+        <div id="panel-verify" class="modal-panel"></div>
+      </div>
+    </div>
+  </div>
+  <script src="/js/app.js?v=20260826e"></script>
+</body>
+</html>
