@@ -25,6 +25,63 @@ Windows 内核补丁对照与单文件审计平台。对齐漏洞版 / 修复版
 
 ---
 
+## 创新点
+
+相对「对两个 PE 做字节 diff + 丢给一次 LLM」或「一个 Agent 扫整份驱动」，本系统把 Windows 内核补丁分析做成 **可核对的证据链**：工具先取证，固定人设的专家只解读工具返回，报告能回溯到样本、符号和反汇编。核心不在「会写报告」，而在 **修了没有、修全没有、入口链有没有跟完**。
+
+### 1. 补丁完整性是一等公民，不只是「改了哪些函数」
+
+常见 patch-diff 停在符号增删和反汇编对照。这里把 **绕过面 / Feature 关闭路径 / 未改兄弟 / 部分 CALL 点** 做成独立狩猎，并写入报告 §18、§19：
+
+| 问题 | 谁回答 | 产物 |
+|---|---|---|
+| 已知链在 Feature 关闭、失败返回、检查-使用窗口上是否仍可达 | BypassAnalyst + FeatureOffAnalyst | `bypass_pack` |
+| 同前缀未改函数是否仍缺同类 Probe / 锁 | ResidualVulnAnalyst | `residual_pack` |
+| 补丁是否只打在一部分 CALL 点 | AliasSiteAnalyst | `alias_pack` |
+
+图内 **HuntPrep** 为这四路补未改兄弟反汇编、调用克隆和 CFG 缺口；图外 **HuntLab** 再做一轮独立工具循环。交付给补丁负责人和 SOC 的是闭合 / 部分闭合 / 仍有残留，而不是一份「看起来修了」的 diff。
+
+### 2. 固定 13 人专家 + 证据编制，而不是自由发挥的聊天
+
+专家目录写死在 `config.py`，自动编制只决定本轮跑谁，**不发明新人格**。`route_agents` 按证据裁剪：有 Feature xref 才跑 Feature / FeatureOff，有对照函数才跑 ControlPath，标题里有 CVE 才跑 ThreatIntel。每个专家走同一套白名单 tool loop，RVA、函数名、Feature ID、哈希必须来自工具；没有返回就标 unknown，禁止编造。
+
+这避免了「一个大 prompt 读完全文再编故事」。GEPA 只离线回放已完成任务优化提示词，不进在线流水线，避免进化过程污染当次分析。
+
+### 3. 热点用 `.pdata` 尺寸和 Feature，而不是字节差当主证据
+
+内核补丁里 RIP 相对寻址会产生大量无语义字节噪声。证据优先级固定为：
+
+**`.pdata` 函数尺寸 > 反汇编 / 调用差 > Feature xref > 字节差**
+
+WIL `Feature_*` 当作一等信号：新增开关、on-disk dword、IsEnabled xref。映像里为 0 **不等于** 运行时关闭——FeatureOffAnalyst 专门验证关闭后是否回到旧链。跨大版本会在 §2 强制警告，避免把无关重构算进单一 CVE。
+
+### 4. 单文件审计：每个用户可达 API 一个跟链 Agent
+
+没有修复版时，不假装做 patch-diff。内核审计把 IOCTL / Immediate 表 / FastIo / MajorFunction 拆成最多 32 条入口，**一条入口一个 agent**，禁止切换目标、禁止扫整份驱动。
+
+相对「一个模型看完全盘」的做法：
+
+- 共享 trampoline（`DispatchDeviceControl` 等）折叠到表目标，避免几十个重复 dispatcher。
+- `unresolved` 非空不能 `done`：本模块继续 `disasm`，跨模块必须 `list_imports` → `load_module` → `disasm(name, module=...)`。
+- 已加固 / wrapper 用短预算，高风险入口用满预算；预算耗尽写入 `blocked`，不假装跟完。
+- LLM 402 停掉后续入口，已完成的写入 `path_agents.json`，页面可只重跑未完成的，并增量刷新 UI。
+
+产出是缺陷类 **嫌疑** 和隔离 VM **观察条件**（看哪把锁、哪次 Probe），不是可复制触发步骤。
+
+### 5. 从 Patch Tuesday 到可运营结论是同一条链
+
+填 CVE 即可走 MSRC + Winbindex 成对下载（同分支 N vs N-1），不必先手工拆 MSU。工作台把 **KEV 在野、绕过面、失败任务** 放在同一收件箱。19 节报告里 IOC、在野利用、完整性、残留与根因共用样本哈希和符号，SOC / 研究 / 补丁验证不用各做一遍。
+
+### 6. 安全边界做成产品约束，而不是事后删字
+
+提示词、Bypass、HuntLab、审计 agent 一律禁止 exploit / PoC / payload / IOCTL 发送序列。白名单工具无 shell、无任意代码执行。服务器打的 `verify.zip` 只给分析师在快照 VM 里自行核对。结论带【已证实】/【推断】，证据不足写 unknown，而不是补全一条「看起来完整」的利用链。
+
+### 7. 长时多 Agent 跑得完、断得住、续得上
+
+分析在子进程里跑，API 只做 HTTP 与 SSE。对照按节点 checkpoint；审计按入口 checkpoint。额度不足、取消、执笔失败都可以 `resume`，不必从 PE 再来一遍。这是把「27 个入口跟链要一小时、中途 402」当成产品问题，而不是一次失败的脚本。
+
+---
+
 ## 快速开始
 
 需要 **Python 3.10+**、**Node.js 18+**（构建前端）、能访问 Microsoft 符号服务器。PDB 解析还依赖仓库上级目录的 `analysis/parse_pdb.py`（见 [依赖说明](#pdb-解析依赖)）。
