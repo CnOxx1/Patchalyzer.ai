@@ -88,26 +88,67 @@ Vite 在 `http://127.0.0.1:5173`，`/api` 会代理到 `8765`。生产由 FastAP
 
 ## 架构
 
+分析跑在独立子进程里（`backend/worker_cli.py`），API 进程只负责 HTTP、鉴权、SSE 进度和排队。并发上限 `PATCHALYZER_ANALYSIS_CONCURRENCY`（默认 2）。`uvicorn` 使用 `reload=False`，改后端需重启 `python run.py`。
+
+### 系统分层
+
+```mermaid
+flowchart TB
+  subgraph client["浏览器"]
+    SPA["Vue 3 SPA  ui/src → ui/dist"]
+  end
+
+  subgraph http["FastAPI  python run.py"]
+    MAIN["backend/main.py"]
+    AUTH["auth.py  会话 cookie"]
+    SSE["GET /api/jobs/events"]
+  end
+
+  subgraph child["分析子进程  worker_cli"]
+    FULL["kind=full  补丁对照"]
+    AUD["kind=audit  内核审计"]
+    TAIL["kind=hotspot / llm  重跑"]
+  end
+
+  subgraph graphs["编排"]
+    LG["LangGraph  agents/graph.py"]
+    KA["kernel_audit.py"]
+    BOX["agent_tools  白名单工具箱"]
+  end
+
+  subgraph disk["落盘"]
+    DB["SQLite  data/patchalyzer.db"]
+    JOB["data/jobs/id/"]
+    CACHE["pdb_cache / cache/msrc"]
+  end
+
+  SPA -->|"REST + cookie"| MAIN
+  SPA --> SSE
+  MAIN --> AUTH
+  MAIN -->|"spawn"| FULL
+  MAIN -->|"spawn"| AUD
+  MAIN -->|"spawn"| TAIL
+  MAIN --> DB
+  SSE -->|"读 progress.json"| JOB
+  FULL --> LG
+  TAIL --> LG
+  AUD --> KA
+  LG --> BOX
+  KA --> BOX
+  FULL --> JOB
+  AUD --> JOB
+  FULL --> DB
+  AUD --> DB
+  LG --> CACHE
+  KA --> CACHE
 ```
-浏览器  ui/（Vue 3 + Vue Router，构建产物 ui/dist）
-    │  登录 cookie  ·  SSE / 轮询任务
-    ▼
-FastAPI  backend/main.py     python run.py → uvicorn reload=False
-    │  分析在子进程跑，API 进程不占同一 GIL
-    │  并发上限 PATCHALYZER_ANALYSIS_CONCURRENCY（默认 2）
-    ▼
-┌───────────────────────────┬────────────────────────────────┐
-│ 补丁对照 kind=patch_diff  │ 内核审计 kind=kernel_audit      │
-│ LangGraph 工具图 + 13 专家│ PE → PDB → 表面图 → 模式扫描    │
-│                           │ → 每入口一个跟链 agent → 执笔   │
-└───────────────────────────┴────────────────────────────────┘
-    ▼
-SQLite  data/patchalyzer.db   +   data/jobs/{id}/ 产物
-```
+
+### 模块职责
 
 | 层 | 路径 | 职责 |
 |---|---|---|
 | HTTP / 鉴权 | `backend/main.py`、`auth.py` | 任务、登录、博客、补丁日、HuntLab / 研究流程 |
+| 子进程调度 | `worker_proc.py`、`analysis_worker.py` | 拉起 / 监护 / 重挂活着的分析进程 |
 | 图编排 | `backend/agents/graph.py` | 工具边、专家扇出、`finalize_soc` |
 | 节点 | `backend/agents/nodes.py` | 每个 tool / 专家的输入输出 |
 | 状态 | `backend/agents/state.py` | `PatchState` |
@@ -125,23 +166,85 @@ SQLite  data/patchalyzer.db   +   data/jobs/{id}/ 产物
 | GEPA | `gepa_optimize.py` | 离线回放已完成任务优化提示词，不进在线流水线 |
 | 前端 | `ui/src` | 工作台、对照、审计、补丁日、报告渲染（Markdown / Mermaid） |
 
-分析子进程入口：`backend/services/analysis_worker.py`（`run_analysis_job` / `run_audit_job`）。
+### 运行时交互
+
+```mermaid
+sequenceDiagram
+  participant U as 浏览器
+  participant A as FastAPI
+  participant Q as 分析队列
+  participant W as 子进程
+  participant D as SQLite / jobs 目录
+
+  U->>A: POST /api/jobs 或 /api/jobs/audit
+  A->>D: create_job status=pending
+  A->>Q: spawn_worker
+  A-->>U: job_id
+  Q->>W: worker_cli kind=full 或 audit
+  W->>D: status=running 写 progress.json
+  loop 直到结束
+    U->>A: SSE /api/jobs/events 或 GET /jobs/id
+    A->>D: 读进度
+    A-->>U: percent / message
+  end
+  W->>D: artifacts + completed 或 failed
+  U->>A: 下载 report.md / audit.json
+```
+
+三张 LangGraph（均在 `agents/graph.py`）：
+
+| 函数 | Worker kind | 用途 |
+|---|---|---|
+| `build_graph()` | `full` | 完整对照：工具 + 编制 + 13 专家 |
+| `build_tail_graph()` | `hotspot` | 加选热点后从 `pick_hotspots` 重跑尾部 |
+| `build_llm_graph()` | `llm` | 只重跑编制 + 专家，不再下 PDB / 反汇编 |
+
+每个节点包在 `guarded()` 里：检查取消、报进度、按 `checkpoints/{node}.json` 跳过、写断点。
 
 ---
 
-## 补丁对照流水线
+## 逻辑流程
 
-### 怎么发起
+一句话：**入口（上传 / CVE / 补丁日）→ 成对或单文件落盘 → 子进程取证 →（对照则专家图 / 审计则入口 agent）→ 报告与 JSON 入库 → 前端页签。** 图外的 HuntLab、研究流程、GEPA 不并进 19 节正文。
 
-1. **上传** `/analyze`：CVE 必填；漏洞样本可选。不传样本则按 CVE 从 MSRC KB + Winbindex 下载同分支「漏洞版 → 修复版」（优先 amd64）。可另传修复版、更早构建（三版本尺寸时间线）。
-2. **补丁日** `/patch`：选某期公告里的 CVE，不上传文件。
-3. **监控**：打开自动分析后，新补丁日最多再排队若干内核向 CVE（首次打开不会把当月全部倒进去）。
+### 任务生命周期
+
+```mermaid
+flowchart TD
+  CREATE["POST 创建任务  pending"] --> KIND{kind}
+
+  KIND -->|"patch_diff"| PAIR{样本是否成对}
+  PAIR -->|"无漏洞样本"| CVE1["CVE → MSRC KB + Winbindex 成对下载"]
+  PAIR -->|"有漏洞无修复"| CVE2["按 CVE 拉同分支更高构建"]
+  PAIR -->|"已上传成对"| RUN
+  CVE1 --> RUN["子进程 running"]
+  CVE2 --> RUN
+
+  KIND -->|"kernel_audit"| SAMPLE["已有 sample_*.sys"]
+  SAMPLE --> RUN
+
+  RUN --> WORK{流水线}
+  WORK -->|"对照"| GRAPH["LangGraph 工具 + 专家"]
+  WORK -->|"审计"| AUDIT["PE → 表面图 → 入口 agent"]
+  GRAPH --> FIN["finalize_soc 注入 IOC / 情报 / 绕过 / 残留"]
+  AUDIT --> PACK["kernel_audit.json + audit.md"]
+  FIN --> OUT{收尾}
+  PACK --> OUT
+
+  OUT -->|"成功"| OK["completed"]
+  OUT -->|"取消"| CAN["cancelled"]
+  OUT -->|"异常"| FAIL["failed"]
+  OK -->|"报告空 / llm_error / 入口未跟完"| RESUME["POST /jobs/id/resume"]
+  FAIL --> RESUME
+  CAN --> RESUME
+  RESUME --> RUN
+```
 
 不能从 Update Catalog 解 MSU/CAB；文件名从 MSRC 标题推断（可手填）；Winbindex 可能落后于 Patch Tuesday。
 
-### 工具阶段（确定性）
+### 补丁对照主图
 
-证据优先级：**`.pdata` 函数尺寸 > 反汇编 / 调用差 > Feature xref > 字节差**（字节差含 RIP 重定位噪声）。
+对照 `backend/agents/graph.py` 的边。工具阶段可并行；专家阶段两处扇出汇合。
 
 ```mermaid
 flowchart TD
@@ -157,8 +260,130 @@ flowchart TD
   timeline --> join_tools
   cfg --> join_tools
   cfg --> verify_pack
+  verify_pack --> END_V([verify 旁路结束])
   join_tools --> route_agents
+
+  route_agents --> pe_analyst
+  route_agents --> symbol_analyst
+  route_agents --> disasm_analyst
+  route_agents --> feature_analyst
+
+  pe_analyst --> control_analyst
+  symbol_analyst --> control_analyst
+  disasm_analyst --> control_analyst
+  feature_analyst --> control_analyst
+
+  control_analyst --> root_cause
+  root_cause --> detection_analyst
+  root_cause --> threat_intel
+  root_cause --> hunt_prep
+
+  hunt_prep --> bypass_analyst
+  hunt_prep --> residual_analyst
+  hunt_prep --> alias_site_analyst
+  hunt_prep --> feature_off_analyst
+
+  detection_analyst --> report_writer
+  threat_intel --> report_writer
+  bypass_analyst --> report_writer
+  residual_analyst --> report_writer
+  alias_site_analyst --> report_writer
+  feature_off_analyst --> report_writer
+  report_writer --> ENDN([END])
 ```
+
+设计意图：
+
+- Feature 与字节差在热点选择之前并行，xref 能进热点名单。
+- 时间线与反汇编在热点确定后并行；CFG 依赖反汇编。
+- `verify_pack` 从 CFG 旁路到 END，不挡专家；`join_tools` 等时间线 + CFG 齐了再编制。
+- 四专家并行 → 对照路径汇合 → 根因。
+- 根因后：SOC（检测 / 情报）与 HuntPrep 并行；HuntPrep 后再并行 Bypass / Residual / Alias / FeatureOff。
+- ReportWriter 吃齐六路再执笔。收尾 `finalize_soc` 注入 §16–§19 表格，并用调用差覆盖 §6 函数逻辑图。
+
+未勾选 LLM 或未配 Key：工具照跑，专家节点写「跳过」，图不中断。某个专家失败：该节点记 `llm_error`，图仍前进。
+
+### 内核审计主图
+
+单文件、无 patched_pattern。确定性扫描之后，每个用户可达 API 一个跟链 agent。
+
+```mermaid
+flowchart TD
+  UP["上传 .sys / .dll / .exe"] --> PE["extract_pe"]
+  PE --> PDB["fetch_pdb"]
+  PDB --> SUR["build_surface_map"]
+  SUR --> DIS["反汇编 high / medium handler"]
+  DIS --> CAL["跟本模块 callee"]
+  CAL --> SCAN["classify_audit 四类模式"]
+  SCAN --> APIS["collect_hunt_apis 最多 32"]
+  APIS --> LOOP{"还有未完成入口?"}
+  LOOP -->|"resume: 跳过 path_agents 里已完成的"| LOOP
+  LOOP -->|"是"| AGENT["run_tool_loop PATH_SYSTEM"]
+  AGENT --> PUB["_publish_partial 写 kernel_audit.json"]
+  PUB --> Q402{"LLM 额度错误?"}
+  Q402 -->|"是"| STOP["停后续入口 保留 checkpoint"]
+  Q402 -->|"否"| LOOP
+  STOP --> WRITE["执笔 5 节 或离线模板"]
+  LOOP -->|"否"| WRITE
+  WRITE --> OUT2["audit.md + 任务 completed"]
+```
+
+### 单入口 agent 跟链
+
+每个 agent 只跟一条入口。`unresolved` 非空不能 `done`。已加固 / wrapper 用短预算（5 轮 / 12 次工具），其余满预算（14 / 32）。预算耗尽则剩余跳写入 `blocked`（`budget_exhausted`）。
+
+```mermaid
+flowchart TD
+  H["入口 handler"] --> D["disasm"]
+  D --> CALL{"CALL / 导入目标"}
+  CALL -->|"本模块符号"| D
+  CALL -->|"其它 .sys / .dll"| IMP["list_imports"]
+  IMP --> LM["load_module 文件名"]
+  LM --> D2["disasm name module=该文件"]
+  D2 --> CALL
+  CALL -->|"Probe / MDL / 锁挡住"| CL["findings: cleared"]
+  CALL -->|"有汇编证据"| SU["findings: suspect"]
+  CALL -->|"还能继续跟"| UN["写入 unresolved 禁止 done"]
+  CALL -->|"load 失败或无符号"| BK["blocked 附原因 可以 done"]
+  UN --> D
+  CL --> JSON["输出 done JSON"]
+  SU --> JSON
+  BK --> JSON
+```
+
+共享 trampoline（`DispatchDeviceControl` / `ImmediateCallDispatch` 等）折叠到表目标，避免几十个重复 dispatcher agent。
+
+### 图外能力（不进 19 节）
+
+```mermaid
+flowchart LR
+  DONE["对照任务 completed"] --> HL["HuntLab  绕过面 + 变体"]
+  DONE --> RS["研究流程  入口表面图狩猎"]
+  DONE --> GP["GEPA  离线优化提示词"]
+  HL --> HMD["hunt_lab.md"]
+  RS --> RMD["research.md"]
+  GP --> SET["写回设置里的专家 prompt"]
+```
+
+| 入口 | 说明 |
+|---|---|
+| `POST /jobs/{id}/hunt-lab` | 独立工具循环，两轨：补丁完整性 / 同类变体 |
+| `POST /jobs/{id}/research` | 对照完成后的入口狩猎，禁止 IOCTL 触发步骤 |
+| `POST /api/config/llm/gepa` | 用历史任务进化当前选中分析师的 prompt |
+
+---
+
+## 补丁对照流水线
+
+### 怎么发起
+
+1. **上传** `/analyze`：CVE 必填；漏洞样本可选。不传样本则按 CVE 从 MSRC KB + Winbindex 下载同分支「漏洞版 → 修复版」（优先 amd64）。可另传修复版、更早构建（三版本尺寸时间线）。
+2. **补丁日** `/patch`：选某期公告里的 CVE，不上传文件。
+3. **监控**：打开自动分析后，新补丁日最多再排队若干内核向 CVE（首次打开不会把当月全部倒进去）。
+
+主图见 [逻辑流程 · 补丁对照主图](#补丁对照主图)。证据优先级：**`.pdata` 函数尺寸 > 反汇编 / 调用差 > Feature xref > 字节差**（字节差含 RIP 重定位噪声）。
+
+### 工具阶段（确定性）
 
 | 节点 | 做什么 |
 |---|---|
@@ -229,16 +454,7 @@ HuntPrep 是确定性节点：补未改兄弟反汇编，并用调用克隆 / CF
 
 ## 内核审计流水线
 
-面向「手头只有一份驱动」：没有 patched_pattern，不对照修复版。
-
-```
-上传 .sys
-    → PE + PDB
-    → 表面图：DeviceControl / Immediate 表 / FastIo / MajorFunction
-    → 绝对模式扫描（缺 Probe、缺锁、生命周期、检查-使用窗口）
-    → 每个用户可达 API 一个 agent，沿 CALL 链跟到本模块子函数或其它 .sys/.dll
-    → 执笔 5 节中文短报告
-```
+面向「手头只有一份驱动」：没有 patched_pattern，不对照修复版。主图与跟链循环见 [逻辑流程 · 内核审计主图](#内核审计主图) 与 [单入口 agent 跟链](#单入口-agent-跟链)。
 
 入口选择（最多 32 个 agent）：
 
